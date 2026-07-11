@@ -14,6 +14,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 import notion_api as nx
+import plan
 
 load_dotenv(Path(__file__).with_name(".env"))
 
@@ -31,6 +32,18 @@ MUSCLES = {
     "Pull": "Back · Biceps · Rear delts",
     "Legs": "Quads · Hamstrings · Glutes · Calves",
 }
+
+RPE_LABELS = {6: "6 · easy", 7: "7 · 3 left", 8: "8 · 2 left", 9: "9 · 1 left", 10: "10 · max"}
+RPE_OPTIONS = ["", "6 · easy", "7 · 3 left", "8 · 2 left", "9 · 1 left", "10 · max"]
+RPE_HELP = "How hard it felt — 10 = all-out, 9 = ~1 rep left, 8 = ~2 left, 7 = ~3 left. Aim 8–9 on working sets."
+
+
+def rpe_to_label(n):
+    return RPE_LABELS.get(int(round(n)), "") if n is not None else ""
+
+
+def label_to_rpe(label):
+    return int(label.split()[0]) if label else None
 
 st.set_page_config(page_title="Life HQ — Gym & Sleep", page_icon="💪", layout="wide")
 
@@ -95,6 +108,19 @@ def sets_for_session(session_id):
     )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def training_days():
+    """{iso_date: sets_logged} for each day that has >=1 logged Weight."""
+    out = {}
+    for r in nx.query(SETLOG_DS, page_size=100):
+        p = r["properties"]
+        d, w = nx.date_start(p, "Date"), nx.number(p, "Weight kg")
+        if d and w is not None:
+            key = d[:10]
+            out[key] = out.get(key, 0) + 1
+    return out
+
+
 def sleep_ds_id():
     # Prefer an explicit id (env/secret) so cloud deploys don't recreate the DB
     # on every reboot; else the locally-cached id from first creation.
@@ -146,50 +172,96 @@ with tab_log:
         )
 
         rows = sets_for_session(sess["id"])
-        recs, page_ids = [], []
+        sets_data = []
         for r in rows:
             p = r["properties"]
             ex_ids = nx.relation_ids(p, "Exercise")
-            ex_name = exercises.get(ex_ids[0], {}).get("name") if ex_ids else None
-            recs.append({
-                "Exercise": ex_name or nx.title_text(p, "Entry"),
-                "Set": nx.number(p, "Set #"),
-                "Target": nx.number(p, "Target kg"),
-                "Weight": nx.number(p, "Weight kg"),
-                "Reps": nx.number(p, "Reps"),
-                "RPE": nx.number(p, "RPE"),
-                "Done": nx.checkbox(p, "Done"),
+            name = (exercises.get(ex_ids[0], {}).get("name") if ex_ids else None) or nx.title_text(p, "Entry")
+            tgt = nx.number(p, "Target kg")
+            sets_data.append({
+                "pid": r["id"], "name": name, "set": nx.number(p, "Set #"),
+                "target": tgt, "weight": nx.number(p, "Weight kg"), "reps": nx.number(p, "Reps"),
+                "rpe": rpe_to_label(nx.number(p, "RPE")), "done": nx.checkbox(p, "Done"),
+                "note": nx.rich_text(p, "Notes"), "weighted": tgt is not None,
             })
-            page_ids.append(r["id"])
 
-        if not recs:
-            st.warning("This session has no Set Log rows yet (skeleton not populated).")
+        if not sets_data:
+            st.warning("This session hasn't been populated with sets yet.")
+            st.caption(f"Build the {day_name} lineup with your double-progression targets, then log it below.")
+            if st.button("⚡ Generate today's sets", type="primary", width="stretch"):
+                ex_by_name = {
+                    v["name"]: {"id": eid, "increment": v["increment"], "start": v["start"]}
+                    for eid, v in exercises.items()
+                }
+                try:
+                    with st.spinner("Building your session…"):
+                        made, missing = plan.generate_sets(
+                            nx, SETLOG_DS, sess["id"], day_name, day_iso, ex_by_name
+                        )
+                    if missing:
+                        st.warning("Skipped (no match): " + ", ".join(missing))
+                    st.success(f"Generated {made} sets — reloading…")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(str(exc)[:400])
         else:
-            original = pd.DataFrame(recs)
-            edited = st.data_editor(
-                original,
-                key=f"editor_{sess['id']}",
-                use_container_width=True,
-                hide_index=True,
-                disabled=["Exercise", "Set", "Target"],
-                column_config={
-                    "Target": st.column_config.NumberColumn("Target kg", format="%.1f"),
-                    "Weight": st.column_config.NumberColumn("Weight kg", format="%.1f", min_value=0.0, step=0.5),
-                    "Reps": st.column_config.NumberColumn("Reps", min_value=0, step=1),
-                    "RPE": st.column_config.NumberColumn("RPE", min_value=1.0, max_value=10.0, step=0.5),
-                    "Done": st.column_config.CheckboxColumn("Done"),
-                },
-            )
+            done_n = sum(1 for s in sets_data if s["done"])
+            st.progress(done_n / len(sets_data), text=f"{done_n} / {len(sets_data)} sets done")
+            show_rpe = st.checkbox("Log RPE", value=False, help=RPE_HELP)
+            st.caption("Fill weight + reps, flip **done**, then hit Save. Untouched rows aren't logged.")
 
-            if st.button("💾 Save sets", type="primary"):
+            orig, inp = {}, {}
+            with st.form(f"log_{sess['id']}", border=False):
+                last = None
+                for s in sets_data:
+                    if s["name"] != last:
+                        last = s["name"]
+                        hdr = f"**{s['name']}**" + (f"  ·  target {s['target']:g} kg" if s["weighted"] else "")
+                        st.markdown(hdr)
+                        if s["note"] and not s["weighted"]:
+                            st.caption(s["note"])
+                    pid = s["pid"]
+                    orig[pid] = (s["weight"], s["reps"], s["rpe"], s["done"])
+                    wants_reps = s["weighted"] or "rep" in s["note"].lower() or "amrap" in s["note"].lower()
+                    widths = [0.4]
+                    if s["weighted"]:
+                        widths.append(1.2)
+                    if wants_reps:
+                        widths.append(1.1)
+                    if s["weighted"] and show_rpe:
+                        widths.append(1.2)
+                    widths.append(1.0)
+                    c = st.columns(widths)
+                    i = 0
+                    c[i].markdown(f"**S{int(s['set']) if s['set'] else '·'}**"); i += 1
+                    w = s["weight"]
+                    if s["weighted"]:
+                        w = c[i].number_input("kg", value=s["weight"], min_value=0.0, step=0.5, format="%.1f", key=f"w_{pid}", label_visibility="collapsed"); i += 1
+                    rp = s["reps"]
+                    if wants_reps:
+                        rp = c[i].number_input("reps", value=s["reps"], min_value=0, step=1, key=f"r_{pid}", label_visibility="collapsed"); i += 1
+                    rpe_val = s["rpe"]
+                    if s["weighted"] and show_rpe:
+                        sel = RPE_OPTIONS.index(s["rpe"]) if s["rpe"] in RPE_OPTIONS else 0
+                        rpe_val = c[i].selectbox("rpe", RPE_OPTIONS, index=sel, key=f"rpe_{pid}", label_visibility="collapsed"); i += 1
+                    dn = c[i].toggle("done", value=s["done"], key=f"d_{pid}")
+                    inp[pid] = (w, rp, rpe_val, dn)
+                submitted = st.form_submit_button("💾 Save all", type="primary", width="stretch")
+
+            if submitted:
                 saved, errors = 0, []
-                for i, pid in enumerate(page_ids):
+                for pid, (w, rp, rpe_val, dn) in inp.items():
+                    ow, orp, orpe, odn = orig[pid]
                     props = {}
-                    for col, field in (("Weight", "Weight kg"), ("Reps", "Reps"), ("RPE", "RPE")):
-                        if _changed(original.at[i, col], edited.at[i, col]):
-                            props[field] = {"number": _num(edited.at[i, col])}
-                    if bool(original.at[i, "Done"]) != bool(edited.at[i, "Done"]):
-                        props["Done"] = {"checkbox": bool(edited.at[i, "Done"])}
+                    if _changed(ow, w):
+                        props["Weight kg"] = {"number": _num(w)}
+                    if _changed(orp, rp):
+                        props["Reps"] = {"number": _num(rp)}
+                    if (orpe or "") != (rpe_val or ""):
+                        props["RPE"] = {"number": label_to_rpe(rpe_val)}
+                    if bool(odn) != bool(dn):
+                        props["Done"] = {"checkbox": bool(dn)}
                     if props:
                         try:
                             nx.update_page(pid, props)
@@ -199,12 +271,69 @@ with tab_log:
                 if errors:
                     st.error(f"Saved {saved}, {len(errors)} failed — {errors[0]}")
                 elif saved:
-                    st.success(f"Saved {saved} row(s) to Notion.")
+                    st.success(f"Saved {saved} set(s).")
+                    st.cache_data.clear()
                 else:
                     st.info("No changes to save.")
 
 # ------------------------------------------------------------ Progress tab
 with tab_prog:
+    st.markdown("#### How consistent you've been")
+    _days = training_days()
+    if not _days:
+        st.info("No workouts logged yet — log sets on the Log tab and your consistency shows up here.")
+    else:
+        _dts = sorted(dt.date.fromisoformat(k) for k in _days)
+        _today = dt.date.today()
+        _wk = _today - dt.timedelta(days=_today.weekday())
+        _mo = _today.replace(day=1)
+        _c = st.columns(4)
+        _c[0].metric("This week", sum(1 for d in _dts if d >= _wk))
+        _c[1].metric("This month", sum(1 for d in _dts if d >= _mo))
+        _c[2].metric("Last 30 days", sum(1 for d in _dts if d >= _today - dt.timedelta(days=30)))
+        _c[3].metric("Days since last", (_today - _dts[-1]).days)
+        st.caption("Counts days you logged a workout in this app.")
+
+        _weeks = []
+        for _i in range(11, -1, -1):
+            _ws = _wk - dt.timedelta(weeks=_i)
+            _weeks.append({
+                "Week of": _ws,
+                "Workouts": sum(1 for d in _dts if _ws <= d < _ws + dt.timedelta(days=7)),
+            })
+        _wdf = pd.DataFrame(_weeks)
+        _wdf["Week of"] = pd.to_datetime(_wdf["Week of"])
+        st.altair_chart(
+            alt.Chart(_wdf).mark_bar(size=18).encode(
+                x=alt.X("Week of:T", title=""),
+                y=alt.Y("Workouts:Q", title="Workouts / week", axis=alt.Axis(tickMinStep=1)),
+                tooltip=["Week of:T", "Workouts:Q"],
+            ).properties(height=200),
+            width="stretch",
+        )
+
+        _grid, _gs, _cur = [], _wk - dt.timedelta(weeks=11), _wk - dt.timedelta(weeks=11)
+        while _cur <= _today:
+            _grid.append({
+                "week": (_cur - _gs).days // 7,
+                "dow": _cur.strftime("%a"),
+                "date": _cur.isoformat(),
+                "sets": _days.get(_cur.isoformat(), 0),
+            })
+            _cur += dt.timedelta(days=1)
+        _gdf = pd.DataFrame(_grid)
+        st.altair_chart(
+            alt.Chart(_gdf).mark_rect(stroke="white", strokeWidth=2).encode(
+                x=alt.X("week:O", title="last 12 weeks", axis=alt.Axis(labels=False, ticks=False)),
+                y=alt.Y("dow:N", sort=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], title=""),
+                color=alt.Color("sets:Q", title="sets", scale=alt.Scale(scheme="greens")),
+                tooltip=["date", "sets"],
+            ).properties(height=170),
+            width="stretch",
+        )
+
+    st.divider()
+    st.markdown("#### Strength by exercise")
     names = sorted({v["name"] for v in exercises.values() if v["name"]})
     if not names:
         st.info("No exercises found.")
@@ -236,14 +365,14 @@ with tab_prog:
                 .encode(x=alt.X("Date:T", title=""), y=alt.Y("Weight:Q", title="Top-set weight (kg)"))
                 .properties(height=320)
             )
-            st.altair_chart(chart, use_container_width=True)
+            st.altair_chart(chart, width="stretch")
             c = st.columns(3)
             c[0].metric("Best ever", f"{df['Weight'].max():.1f} kg")
             c[1].metric("Latest top set", f"{top_sets.iloc[-1]['Weight']:.1f} kg")
             c[2].metric("Sessions logged", f"{top_sets.shape[0]}")
             st.dataframe(
                 df.sort_values("Date", ascending=False).head(20),
-                hide_index=True, use_container_width=True,
+                hide_index=True, width="stretch",
             )
 
 # ------------------------------------------------------------ Upcoming tab
@@ -330,7 +459,7 @@ with tab_sleep:
             target = alt.Chart(pd.DataFrame({"y": [SLEEP_TARGET]})).mark_rule(
                 color="#E24B4A", strokeDash=[4, 4]
             ).encode(y="y:Q")
-            st.altair_chart(bars + target, use_container_width=True)
+            st.altair_chart(bars + target, width="stretch")
             last7 = df.sort_values("Date").tail(7)["Hours"].mean()
             st.metric("Avg last 7 nights", f"{last7:.1f} h", delta=f"{last7 - SLEEP_TARGET:+.1f} vs 7h target")
         else:
