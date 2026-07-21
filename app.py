@@ -223,25 +223,30 @@ with tab_log:
             })
 
         if not sets_data:
-            st.warning("This session hasn't been populated with sets yet.")
-            st.caption(f"Build the {day_name} lineup with your double-progression targets, then log it below.")
-            if st.button("⚡ Generate today's sets", type="primary", width="stretch"):
-                ex_by_name = {
-                    v["name"]: {"id": eid, "increment": v["increment"], "start": v["start"]}
-                    for eid, v in exercises.items()
-                }
+            gen_key = f"gen_{sess['id']}"
+            ex_by_name = {
+                v["name"]: {"id": eid, "increment": v["increment"], "start": v["start"]}
+                for eid, v in exercises.items()
+            }
+            # Auto-build today's sets on open — no dependency on the 6:30 laptop task.
+            # "done"/"failed" latch so a lagging re-read can't double-generate or loop.
+            if st.session_state.get(gen_key) not in ("failed", "done") and day_name in plan.PLANS:
                 try:
-                    with st.spinner("Building your session…"):
-                        made, missing = plan.generate_sets(
+                    with st.spinner(f"Setting up today's {day_name} — one moment…"):
+                        made, _missing = plan.generate_sets(
                             nx, SETLOG_DS, sess["id"], day_name, day_iso, ex_by_name
                         )
-                    if missing:
-                        st.warning("Skipped (no match): " + ", ".join(missing))
-                    st.success(f"Generated {made} sets — reloading…")
-                    st.cache_data.clear()
-                    st.rerun()
+                    st.session_state[gen_key] = "done" if made > 0 else "failed"
+                    if made > 0:
+                        st.cache_data.clear()
+                        st.rerun()
                 except Exception as exc:  # noqa: BLE001
-                    st.error(str(exc)[:400])
+                    st.session_state[gen_key] = "failed"
+                    st.error(f"Auto-setup hit an error: {str(exc)[:200]}")
+            st.warning(f"Tap to build today's {day_name} lineup:")
+            if st.button("⚡ Generate today's sets", type="primary", width="stretch"):
+                st.session_state[gen_key] = None
+                st.rerun()
         else:
             perf = last_perf(day_iso)
             plan_reps = {e[0]: e[3] for e in plan.PLANS.get(day_name, {}).get("ex", [])}
