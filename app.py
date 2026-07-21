@@ -87,8 +87,10 @@ def save_set(pid):
     try:
         nx.update_page(pid, props)
         ss[f"err_{pid}"] = ""
+        ss["_toast"] = ("ok", ss.get(f"lbl_{pid}", "Set"))
     except Exception as exc:  # noqa: BLE001
         ss[f"err_{pid}"] = str(exc)[:150]
+        ss["_toast"] = ("err", ss.get(f"lbl_{pid}", "Set"))
 
 
 def toggle_done(pid):
@@ -224,6 +226,14 @@ except Exception as exc:  # noqa: BLE001
 
 exercises = load_exercises()
 
+# Confirmation popup for the last per-set save (set by the save_set callback).
+if "_toast" in st.session_state:
+    _kind, _lbl = st.session_state.pop("_toast")
+    if _kind == "ok":
+        st.toast(f"✓ {_lbl} saved", icon="✅")
+    else:
+        st.toast(f"⚠️ {_lbl} didn't save — tap again", icon="⚠️")
+
 tab_log, tab_prog, tab_up, tab_sleep = st.tabs(
     ["🏋️ Log", "📈 Progress", "🗓️ Upcoming", "😴 Sleep"]
 )
@@ -297,6 +307,7 @@ with tab_log:
             last_name = None
             for s in sets_data:
                 pid = s["pid"]
+                st.session_state[f"lbl_{pid}"] = f"{s['name']} · S{int(s['set']) if s['set'] else 1}"
                 if f"done_{pid}" not in st.session_state:
                     st.session_state[f"done_{pid}"] = s["done"]
                 treps = plan_reps.get(s["name"]) if s["weighted"] else None
