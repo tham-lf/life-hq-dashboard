@@ -56,6 +56,15 @@ try:
 except Exception:  # noqa: BLE001  (no secrets file locally is fine)
     pass
 
+st.markdown(
+    """<style>
+    div[data-testid="stNumberInput"] input { font-size: 1.15rem; padding: 0.45rem 0.5rem; }
+    div[data-testid="stNumberInput"] button { min-height: 2.6rem; }
+    div.stButton > button { min-height: 2.9rem; font-size: 1.05rem; }
+    </style>""",
+    unsafe_allow_html=True,
+)
+
 
 def muscles_for(day):
     for prefix, mus in MUSCLES.items():
@@ -64,19 +73,27 @@ def muscles_for(day):
     return "—"
 
 
-def _num(v):
-    if v is None:
-        return None
+def save_set(pid):
+    """Write one set to Notion immediately (per-set autosave — survives a
+    mid-workout disconnect; only the current set can be lost, never the session)."""
+    ss = st.session_state
+    props = {"Done": {"checkbox": bool(ss.get(f"done_{pid}", False))}}
+    if ss.get(f"w_{pid}") is not None:
+        props["Weight kg"] = {"number": float(ss[f"w_{pid}"])}
+    if ss.get(f"r_{pid}") is not None:
+        props["Reps"] = {"number": int(ss[f"r_{pid}"])}
+    if f"rpe_{pid}" in ss:
+        props["RPE"] = {"number": label_to_rpe(ss[f"rpe_{pid}"])}
     try:
-        if pd.isna(v):
-            return None
-    except (TypeError, ValueError):
-        pass
-    return float(v)
+        nx.update_page(pid, props)
+        ss[f"err_{pid}"] = ""
+    except Exception as exc:  # noqa: BLE001
+        ss[f"err_{pid}"] = str(exc)[:150]
 
 
-def _changed(a, b):
-    return _num(a) != _num(b)
+def toggle_done(pid):
+    st.session_state[f"done_{pid}"] = not st.session_state.get(f"done_{pid}", False)
+    save_set(pid)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -118,6 +135,26 @@ def training_days():
         if d and w is not None:
             key = d[:10]
             out[key] = out.get(key, 0) + 1
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def last_perf(before_iso):
+    """{exercise_id: (weight, reps, date)} — heaviest set of the most recent
+    session BEFORE before_iso, for the 'last time' progress hint while logging."""
+    by_ex = {}
+    for r in nx.query(SETLOG_DS, sorts=[{"property": "Date", "direction": "descending"}], page_size=100):
+        p = r["properties"]
+        ex = nx.relation_ids(p, "Exercise")
+        d, w, rp = nx.date_start(p, "Date"), nx.number(p, "Weight kg"), nx.number(p, "Reps")
+        if not ex or w is None or not d or d[:10] >= before_iso:
+            continue
+        by_ex.setdefault(ex[0], []).append((d[:10], w, rp))
+    out = {}
+    for eid, lst in by_ex.items():
+        last_date = max(x[0] for x in lst)
+        w_best, rp_best = max(((w, rp) for (d, w, rp) in lst if d == last_date), key=lambda x: x[0])
+        out[eid] = (w_best, rp_best, last_date)
     return out
 
 
@@ -179,7 +216,7 @@ with tab_log:
             name = (exercises.get(ex_ids[0], {}).get("name") if ex_ids else None) or nx.title_text(p, "Entry")
             tgt = nx.number(p, "Target kg")
             sets_data.append({
-                "pid": r["id"], "name": name, "set": nx.number(p, "Set #"),
+                "pid": r["id"], "ex_id": ex_ids[0] if ex_ids else None, "name": name, "set": nx.number(p, "Set #"),
                 "target": tgt, "weight": nx.number(p, "Weight kg"), "reps": nx.number(p, "Reps"),
                 "rpe": rpe_to_label(nx.number(p, "RPE")), "done": nx.checkbox(p, "Done"),
                 "note": nx.rich_text(p, "Notes"), "weighted": tgt is not None,
@@ -206,75 +243,62 @@ with tab_log:
                 except Exception as exc:  # noqa: BLE001
                     st.error(str(exc)[:400])
         else:
-            done_n = sum(1 for s in sets_data if s["done"])
+            perf = last_perf(day_iso)
+            plan_reps = {e[0]: e[3] for e in plan.PLANS.get(day_name, {}).get("ex", [])}
+            done_n = sum(1 for s in sets_data if st.session_state.get(f"done_{s['pid']}", s["done"]))
             st.progress(done_n / len(sets_data), text=f"{done_n} / {len(sets_data)} sets done")
             show_rpe = st.checkbox("Log RPE", value=False, help=RPE_HELP)
-            st.caption("Fill weight + reps, flip **done**, then hit Save. Untouched rows aren't logged.")
+            st.caption("Boxes pre-fill to your target — hit it? just tap **Done**. Different? change the box first. Every **Done** saves to Notion instantly (no session to lose).")
 
-            orig, inp = {}, {}
-            with st.form(f"log_{sess['id']}", border=False):
-                last = None
-                for s in sets_data:
-                    if s["name"] != last:
-                        last = s["name"]
-                        hdr = f"**{s['name']}**" + (f"  ·  target {s['target']:g} kg" if s["weighted"] else "")
-                        st.markdown(hdr)
-                        if s["note"] and not s["weighted"]:
-                            st.caption(s["note"])
-                    pid = s["pid"]
-                    orig[pid] = (s["weight"], s["reps"], s["rpe"], s["done"])
-                    wants_reps = s["weighted"] or "rep" in s["note"].lower() or "amrap" in s["note"].lower()
-                    widths = [0.4]
+            last_name = None
+            for s in sets_data:
+                pid = s["pid"]
+                if f"done_{pid}" not in st.session_state:
+                    st.session_state[f"done_{pid}"] = s["done"]
+                treps = plan_reps.get(s["name"]) if s["weighted"] else None
+                if s["name"] != last_name:
+                    last_name = s["name"]
+                    hdr = f"**{s['name']}**"
                     if s["weighted"]:
-                        widths.append(1.2)
-                    if wants_reps:
-                        widths.append(1.1)
-                    if s["weighted"] and show_rpe:
-                        widths.append(1.2)
-                    widths.append(1.0)
-                    c = st.columns(widths)
-                    i = 0
-                    c[i].markdown(f"**S{int(s['set']) if s['set'] else '·'}**"); i += 1
-                    w = s["weight"]
-                    if s["weighted"]:
-                        w = c[i].number_input("kg", value=s["weight"], min_value=0.0, step=0.5, format="%.1f", key=f"w_{pid}", label_visibility="collapsed"); i += 1
-                    rp = s["reps"]
-                    if wants_reps:
-                        rp = c[i].number_input("reps", value=s["reps"], min_value=0, step=1, key=f"r_{pid}", label_visibility="collapsed"); i += 1
-                    rpe_val = s["rpe"]
-                    if s["weighted"] and show_rpe:
+                        hdr += f"  ·  🎯 {s['target']:g} kg" + (f" × {treps}" if treps else "")
+                    st.markdown(hdr)
+                    lp = perf.get(s["ex_id"])
+                    if lp:
+                        st.caption(f"↩️ last time: {lp[0]:g} kg × {lp[1] if lp[1] is not None else '—'}  ·  {lp[2]}")
+                    elif s["note"] and not s["weighted"]:
+                        st.caption(s["note"])
+
+                wants_reps = s["weighted"] or "rep" in s["note"].lower() or "amrap" in s["note"].lower()
+                dflt_w = s["weight"] if s["weight"] is not None else s["target"]
+                dflt_r = s["reps"] if s["reps"] is not None else (treps if s["weighted"] else None)
+                fields = []
+                if s["weighted"]:
+                    fields.append("w")
+                if wants_reps:
+                    fields.append("r")
+                if s["weighted"] and show_rpe:
+                    fields.append("rpe")
+                fields.append("done")
+                span = {"w": 1.1, "r": 1.0, "rpe": 1.2, "done": 1.6}
+                cols = st.columns([0.4] + [span[f] for f in fields])
+                cols[0].markdown(f"<div style='padding-top:1.9rem;color:#888'>S{int(s['set']) if s['set'] else '·'}</div>", unsafe_allow_html=True)
+                ci = 1
+                for f in fields:
+                    c = cols[ci]
+                    ci += 1
+                    if f == "w":
+                        c.number_input("weight (kg)", value=float(dflt_w) if dflt_w is not None else None, min_value=0.0, step=0.5, format="%.1f", key=f"w_{pid}", on_change=save_set, args=(pid,))
+                    elif f == "r":
+                        c.number_input("reps", value=int(dflt_r) if dflt_r is not None else None, min_value=0, step=1, key=f"r_{pid}", on_change=save_set, args=(pid,))
+                    elif f == "rpe":
                         sel = RPE_OPTIONS.index(s["rpe"]) if s["rpe"] in RPE_OPTIONS else 0
-                        rpe_val = c[i].selectbox("rpe", RPE_OPTIONS, index=sel, key=f"rpe_{pid}", label_visibility="collapsed"); i += 1
-                    dn = c[i].toggle("done", value=s["done"], key=f"d_{pid}")
-                    inp[pid] = (w, rp, rpe_val, dn)
-                submitted = st.form_submit_button("💾 Save all", type="primary", width="stretch")
-
-            if submitted:
-                saved, errors = 0, []
-                for pid, (w, rp, rpe_val, dn) in inp.items():
-                    ow, orp, orpe, odn = orig[pid]
-                    props = {}
-                    if _changed(ow, w):
-                        props["Weight kg"] = {"number": _num(w)}
-                    if _changed(orp, rp):
-                        props["Reps"] = {"number": _num(rp)}
-                    if (orpe or "") != (rpe_val or ""):
-                        props["RPE"] = {"number": label_to_rpe(rpe_val)}
-                    if bool(odn) != bool(dn):
-                        props["Done"] = {"checkbox": bool(dn)}
-                    if props:
-                        try:
-                            nx.update_page(pid, props)
-                            saved += 1
-                        except Exception as exc:  # noqa: BLE001
-                            errors.append(str(exc)[:200])
-                if errors:
-                    st.error(f"Saved {saved}, {len(errors)} failed — {errors[0]}")
-                elif saved:
-                    st.success(f"Saved {saved} set(s).")
-                    st.cache_data.clear()
-                else:
-                    st.info("No changes to save.")
+                        c.selectbox("RPE", RPE_OPTIONS, index=sel, key=f"rpe_{pid}", on_change=save_set, args=(pid,))
+                    elif f == "done":
+                        dn = st.session_state.get(f"done_{pid}", False)
+                        c.markdown("<div style='height:1.55rem'></div>", unsafe_allow_html=True)
+                        c.button("✓ Done" if dn else "Done", key=f"btn_{pid}", type="primary" if dn else "secondary", on_click=toggle_done, args=(pid,), width="stretch")
+                if st.session_state.get(f"err_{pid}"):
+                    st.caption(f"⚠️ didn't save — {st.session_state[f'err_{pid}']} · tap Done again")
 
 # ------------------------------------------------------------ Progress tab
 with tab_prog:
