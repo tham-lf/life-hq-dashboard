@@ -9,6 +9,7 @@ import requests
 
 NOTION_VERSION = "2025-09-03"
 BASE = "https://api.notion.com/v1"
+_SESSION = requests.Session()  # keep-alive: reuse the TCP/TLS connection across calls
 
 
 def _token():
@@ -44,7 +45,7 @@ def query(data_source_id, filter=None, sorts=None, page_size=100):
         payload["sorts"] = sorts
     out = []
     while True:
-        r = requests.post(url, headers=_headers(), json=payload, timeout=30)
+        r = _SESSION.post(url, headers=_headers(), json=payload, timeout=30)
         _raise(r)
         data = r.json()
         out += data.get("results", [])
@@ -55,7 +56,7 @@ def query(data_source_id, filter=None, sorts=None, page_size=100):
 
 
 def update_page(page_id, properties):
-    r = requests.patch(
+    r = _SESSION.patch(
         f"{BASE}/pages/{page_id}", headers=_headers(), json={"properties": properties}, timeout=30
     )
     _raise(r)
@@ -69,7 +70,7 @@ def create_page(data_source_id, properties, icon=None):
     }
     if icon:
         payload["icon"] = {"type": "emoji", "emoji": icon}
-    r = requests.post(f"{BASE}/pages", headers=_headers(), json=payload, timeout=30)
+    r = _SESSION.post(f"{BASE}/pages", headers=_headers(), json=payload, timeout=30)
     _raise(r)
     return r.json()
 
@@ -83,7 +84,7 @@ def create_database(parent_page_id, title, properties):
         "title": [{"type": "text", "text": {"content": title}}],
         "initial_data_source": {"properties": properties},
     }
-    r = requests.post(f"{BASE}/databases", headers=_headers(), json=payload, timeout=30)
+    r = _SESSION.post(f"{BASE}/databases", headers=_headers(), json=payload, timeout=30)
     _raise(r)
     return r.json()
 

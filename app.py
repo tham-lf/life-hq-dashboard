@@ -111,6 +111,7 @@ def load_exercises():
     return out
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def session_for_date(day_iso):
     rows = nx.query(SESSIONS_DS, filter={"property": "Date", "date": {"equals": day_iso}}, page_size=5)
     return rows[0] if rows else None
@@ -166,6 +167,44 @@ def sleep_ds_id():
     return SLEEP_DS_FILE.read_text().strip() if SLEEP_DS_FILE.exists() else None
 
 
+# Cached reads — these fire on every rerun (all tabs execute); caching keeps a
+# per-set Done tap to ~1 write + 1 fresh sets query instead of ~6 round-trips.
+@st.cache_data(ttl=300, show_spinner=False)
+def notion_ok():
+    nx.query(SESSIONS_DS, page_size=1)
+    return True
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def exercise_history(ex_id):
+    if not ex_id:
+        return []
+    return nx.query(
+        SETLOG_DS,
+        filter={"property": "Exercise", "relation": {"contains": ex_id}},
+        sorts=[{"property": "Date", "direction": "ascending"}],
+        page_size=100,
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def upcoming_sessions(today_iso):
+    return nx.query(
+        SESSIONS_DS,
+        filter={"and": [
+            {"property": "Status", "select": {"equals": "Planned"}},
+            {"property": "Date", "date": {"on_or_after": today_iso}},
+        ]},
+        sorts=[{"property": "Date", "direction": "ascending"}],
+        page_size=30,
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def sleep_logs(ds):
+    return nx.query(ds, sorts=[{"property": "Date", "direction": "ascending"}], page_size=100)
+
+
 # ---------------------------------------------------------------- sidebar
 st.sidebar.title("Life HQ")
 st.sidebar.caption("Gym & sleep · on top of Notion")
@@ -174,7 +213,7 @@ if st.sidebar.button("🔄 Refresh data"):
     st.rerun()
 
 try:
-    nx.query(SESSIONS_DS, page_size=1)
+    notion_ok()
     st.sidebar.success("Notion connected")
 except Exception as exc:  # noqa: BLE001
     st.sidebar.error("Notion not connected")
@@ -370,12 +409,7 @@ with tab_prog:
         default = names.index("Barbell Back Squat") if "Barbell Back Squat" in names else 0
         name = st.selectbox("Exercise", names, index=default)
         ex_id = next((eid for eid, v in exercises.items() if v["name"] == name), None)
-        logs = nx.query(
-            SETLOG_DS,
-            filter={"property": "Exercise", "relation": {"contains": ex_id}},
-            sorts=[{"property": "Date", "direction": "ascending"}],
-            page_size=100,
-        ) if ex_id else []
+        logs = exercise_history(ex_id)
         recs = []
         for r in logs:
             p = r["properties"]
@@ -407,15 +441,7 @@ with tab_prog:
 # ------------------------------------------------------------ Upcoming tab
 with tab_up:
     today_iso = dt.date.today().isoformat()
-    rows = nx.query(
-        SESSIONS_DS,
-        filter={"and": [
-            {"property": "Status", "select": {"equals": "Planned"}},
-            {"property": "Date", "date": {"on_or_after": today_iso}},
-        ]},
-        sorts=[{"property": "Date", "direction": "ascending"}],
-        page_size=30,
-    )
+    rows = upcoming_sessions(today_iso)
     if not rows:
         st.info("No upcoming planned sessions.")
     for r in rows:
@@ -468,11 +494,12 @@ with tab_sleep:
                     props["Notes"] = {"rich_text": [{"text": {"content": note}}]}
                 try:
                     nx.create_page(ds, props)
+                    st.cache_data.clear()
                     st.success(f"Logged {hours:g}h for {night.isoformat()}.")
                 except Exception as exc:  # noqa: BLE001
                     st.error(str(exc)[:400])
 
-        logs = nx.query(ds, sorts=[{"property": "Date", "direction": "ascending"}], page_size=100)
+        logs = sleep_logs(ds)
         recs = []
         for r in logs:
             p = r["properties"]
